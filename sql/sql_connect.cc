@@ -43,6 +43,7 @@
 #include "wsrep_mysqld.h"
 #endif /* WITH_WSREP */
 #include "proxy_protocol.h"
+#include <ssl_compat.h>
 
 HASH global_user_stats, global_client_stats, global_table_stats;
 HASH global_index_stats;
@@ -1112,7 +1113,6 @@ bool setup_connection_thread_globals(THD *thd)
     close_connection(thd, ER_OUT_OF_RESOURCES);
     statistic_increment(aborted_connects,&LOCK_status);
     statistic_increment(connection_errors_internal, &LOCK_status);
-    thd->scheduler->end_thread(thd, 0);
     return 1;                                   // Error
   }
   return 0;
@@ -1303,7 +1303,16 @@ pthread_handler_t handle_one_connection(void *arg)
 
   mysql_thread_set_psi_id(connect->thread_id);
 
-  do_handle_one_connection(connect);
+  if (init_new_connection_handler_thread())
+    connect->close_with_error(0, 0, ER_OUT_OF_RESOURCES);
+  else
+    do_handle_one_connection(connect, true);
+
+  DBUG_PRINT("info", ("killing thread"));
+#if defined(HAVE_OPENSSL) && !defined(EMBEDDED_LIBRARY)
+  ERR_remove_state(0);
+#endif
+  my_thread_end();
   return 0;
 }
 
@@ -1336,16 +1345,13 @@ bool thd_is_connection_alive(THD *thd)
 }
 
 
-void do_handle_one_connection(CONNECT *connect)
+void do_handle_one_connection(CONNECT *connect, bool put_in_cache)
 {
   ulonglong thr_create_utime= microsecond_interval_timer();
   THD *thd;
-  if (connect->scheduler->init_new_connection_thread() ||
-      !(thd= connect->create_thd(NULL)))
+  if (!(thd= connect->create_thd(NULL)))
   {
-    scheduler_functions *scheduler= connect->scheduler;
-    connect->close_with_error(0, 0, ER_OUT_OF_RESOURCES);
-    scheduler->end_thread(0, 0);
+    connect->close_and_delete();
     return;
   }
 
@@ -1381,7 +1387,11 @@ void do_handle_one_connection(CONNECT *connect)
   */
   thd->thread_stack= (char*) &thd;
   if (setup_connection_thread_globals(thd))
+  {
+    unlink_thd(thd);
+    delete thd;
     return;
+  }
 
   for (;;)
   {
@@ -1415,16 +1425,40 @@ end_thread:
     if (thd->userstat_running)
       update_global_user_stats(thd, create_user, time(NULL));
 
-    if (thd->scheduler->end_thread(thd, 1))
-      return;                                 // Probably no-threads
+    unlink_thd(thd);
+    if (IF_WSREP(thd->wsrep_applier, false) || !put_in_cache ||
+        !(connect= cache_thread(thd)))
+      break;
+
+    if (!(connect->create_thd(thd)))
+    {
+      /* Out of resources. Free thread to get more resources */
+      connect->close_and_delete();
+      break;
+    }
+    delete connect;
 
     /*
-      If end_thread() returns, this thread has been schedule to
-      handle the next connection.
+      We have to call store_globals to update mysys_var->id and lock_info
+      with the new thread_id
     */
-    thd= current_thd;
-    thd->thread_stack= (char*) &thd;
+    thd->store_globals();
+
+    /*
+      Create new instrumentation for the new THD job,
+      and attach it to this running pthread.
+    */
+    PSI_CALL_set_thread(PSI_CALL_new_thread(key_thread_one_connection,
+                                            thd, thd->thread_id));
+
+    /* reset abort flag for the thread */
+    thd->mysys_var->abort= 0;
+    thd->thr_create_utime= microsecond_interval_timer();
+    thd->start_utime= thd->thr_create_utime;
+
+    server_threads.insert(thd);
   }
+  delete thd;
 }
 #endif /* EMBEDDED_LIBRARY */
 
@@ -1441,10 +1475,16 @@ void CONNECT::close_and_delete()
 {
   DBUG_ENTER("close_and_delete");
 
-  if (vio)
-    vio_close(vio);
-  if (thread_count_incremented)
-    dec_connection_count(scheduler);
+#if _WIN32
+  if (vio_type == VIO_TYPE_NAMEDPIPE)
+    CloseHandle(pipe);
+  else
+#endif
+  if (vio_type != VIO_CLOSED)
+    mysql_socket_close(sock);
+  vio_type= VIO_CLOSED;
+
+  --*scheduler->connection_count;
   statistic_increment(connection_errors_internal, &LOCK_status);
   statistic_increment(aborted_connects,&LOCK_status);
 
@@ -1473,18 +1513,12 @@ void CONNECT::close_with_error(uint sql_errno,
 }
 
 
-CONNECT::~CONNECT()
-{
-  if (vio)
-    vio_delete(vio);
-}
-
-
 /* Reuse or create a THD based on a CONNECT object */
 
 THD *CONNECT::create_thd(THD *thd)
 {
   bool res, thd_reused= thd != 0;
+  Vio *vio;
   DBUG_ENTER("create_thd");
 
   DBUG_EXECUTE_IF("simulate_failed_connection_2", DBUG_RETURN(0); );
@@ -1503,9 +1537,23 @@ THD *CONNECT::create_thd(THD *thd)
   else if (!(thd= new THD(thread_id)))
     DBUG_RETURN(0);
 
+#if _WIN32
+  if (vio_type == VIO_TYPE_NAMEDPIPE)
+    vio= vio_new_win32pipe(pipe);
+  else
+#endif
+  vio= mysql_socket_vio_new(sock, vio_type, vio_type == VIO_TYPE_SOCKET ?
+                                                        VIO_LOCALHOST : 0);
+  if (!vio)
+  {
+    if (!thd_reused)
+      delete thd;
+    DBUG_RETURN(0);
+  }
+
   set_current_thd(thd);
   res= my_net_init(&thd->net, vio, thd, MYF(MY_THREAD_SPECIFIC));
-  vio= 0;                              // Vio now handled by thd
+  vio_type= VIO_CLOSED;                // Vio now handled by thd
 
   if (unlikely(res || thd->is_error()))
   {
@@ -1517,9 +1565,11 @@ THD *CONNECT::create_thd(THD *thd)
 
   init_net_server_extension(thd);
 
-  thd->security_ctx->host= host;
-  thd->extra_port=         extra_port;
+  thd->security_ctx->host= thd->net.vio->type == VIO_TYPE_NAMEDPIPE ||
+                           thd->net.vio->type == VIO_TYPE_SOCKET ?
+                           my_localhost : 0;
+
   thd->scheduler=          scheduler;
-  thd->real_id=            real_id;
+  thd->real_id= pthread_self(); /* Duplicates THD::store_globals() setting. */
   DBUG_RETURN(thd);
 }

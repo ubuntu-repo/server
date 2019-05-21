@@ -420,12 +420,6 @@ void thd_exit_cond(MYSQL_THD thd, const PSI_stage_info *stage,
 }
 
 extern "C"
-void **thd_ha_data(const THD *thd, const struct handlerton *hton)
-{
-  return (void **) &thd->ha_data[hton->slot].ha_ptr;
-}
-
-extern "C"
 void thd_storage_lock_wait(THD *thd, long long value)
 {
   thd->utime_after_lock+= value;
@@ -437,7 +431,7 @@ void thd_storage_lock_wait(THD *thd, long long value)
 extern "C"
 void *thd_get_ha_data(const THD *thd, const struct handlerton *hton)
 {
-  return *thd_ha_data(thd, hton);
+  return thd->ha_data[hton->slot].ha_ptr;
 }
 
 
@@ -450,6 +444,7 @@ void thd_set_ha_data(THD *thd, const struct handlerton *hton,
                      const void *ha_data)
 {
   plugin_ref *lock= &thd->ha_data[hton->slot].lock;
+  thd->ha_data[hton->slot].ha_ptr= const_cast<void*>(ha_data);
   if (ha_data && !*lock)
     *lock= ha_lock_engine(NULL, (handlerton*) hton);
   else if (!ha_data && *lock)
@@ -457,7 +452,6 @@ void thd_set_ha_data(THD *thd, const struct handlerton *hton,
     plugin_unlock(NULL, *lock);
     *lock= NULL;
   }
-  *thd_ha_data(thd, hton)= (void*) ha_data;
 }
 
 
@@ -726,7 +720,6 @@ THD::THD(my_thread_id id, bool is_wsrep_applier)
   event_scheduler.data= 0;
   event_scheduler.m_psi= 0;
   skip_wait_timeout= false;
-  extra_port= 0;
   catalog= (char*)"std"; // the only catalog we have for now
   main_security_ctx.init();
   security_ctx= &main_security_ctx;
